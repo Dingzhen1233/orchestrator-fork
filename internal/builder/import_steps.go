@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -80,7 +81,7 @@ func (p *buildPipeline) phaseImport() (retErr error) {
 	// No --no-progress: flatten-ctl's pull/flatten progress goes to the guest
 	// command stderr, which sandbox-ctl streams to journald=build (stdout is
 	// the artifact). So the SDK sees `pull: N/M layers`, `flatten: …` live.
-	args := []string{"export", "--tmpdir", "/pull"}
+	args := []string{"export", "--conversion-semantics", image.ConversionSemantics, "--tmpdir", "/pull"}
 	args = append(args, p.flattenConfigArg()...)
 	if s.Insecure {
 		args = append(args, "--insecure")
@@ -163,10 +164,11 @@ func (p *buildPipeline) useLocalImage(path string) error {
 }
 
 type importRefererLookup struct {
-	Supported  bool   `json:"supported"`
-	Subject    string `json:"subject"`
-	Hit        bool   `json:"hit"`
-	ManifestID string `json:"manifest_id"`
+	ConversionSemantics string `json:"conversion_semantics"`
+	Supported           bool   `json:"supported"`
+	Subject             string `json:"subject"`
+	Hit                 bool   `json:"hit"`
+	ManifestID          string `json:"manifest_id"`
 }
 
 func importSourceReference(original string, lookup importRefererLookup) string {
@@ -180,6 +182,9 @@ func decodeImportRefererLookup(data []byte) (importRefererLookup, error) {
 	var out importRefererLookup
 	if err := json.Unmarshal(data, &out); err != nil {
 		return importRefererLookup{}, fmt.Errorf("parse lookup result: %w", err)
+	}
+	if out.ConversionSemantics != image.ConversionSemantics {
+		return importRefererLookup{}, fmt.Errorf("lookup generator conversion semantics %q, require %q", out.ConversionSemantics, image.ConversionSemantics)
 	}
 	if out.Supported {
 		if _, err := name.NewDigest(out.Subject); err != nil {
@@ -195,7 +200,7 @@ func (p *buildPipeline) lookupImportReferer(sb *phaseSandbox) (importRefererLook
 		return importRefererLookup{}, fmt.Errorf("owner token is empty")
 	}
 	outPath := filepath.Join(p.phaseRunDir("a"), "referer.lookup.json")
-	args := []string{"referer", "lookup", "--json", "--owner", s.ImportReferer.Owner}
+	args := []string{"referer", "lookup", "--conversion-semantics", image.ConversionSemantics, "--json", "--owner", s.ImportReferer.Owner}
 	args = append(args, p.flattenConfigArg()...)
 	if s.Insecure {
 		args = append(args, "--insecure")
@@ -238,7 +243,7 @@ func (p *buildPipeline) writeImportReferer(sb *phaseSandbox, subject, manifestID
 	if subject == "" {
 		return fmt.Errorf("subject is empty")
 	}
-	args := []string{"referer", "put", "--owner", s.ImportReferer.Owner, "--manifest-id", manifestID}
+	args := []string{"referer", "put", "--conversion-semantics", image.ConversionSemantics, "--owner", s.ImportReferer.Owner, "--manifest-id", manifestID}
 	if s.ImportReferer.Validity != "" {
 		args = append(args, "--validity", s.ImportReferer.Validity)
 	}

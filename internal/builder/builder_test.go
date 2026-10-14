@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -27,7 +28,7 @@ import (
 
 func TestDecodeImportRefererLookupRequiresDigestSubject(t *testing.T) {
 	digest := strings.Repeat("a", 64)
-	valid := fmt.Sprintf(`{"supported":true,"subject":"registry.example/repo@sha256:%s"}`, digest)
+	valid := fmt.Sprintf(`{"conversion_semantics":%q,"supported":true,"subject":"registry.example/repo@sha256:%s"}`, image.ConversionSemantics, digest)
 	got, err := decodeImportRefererLookup([]byte(valid))
 	if err != nil || got.Subject != "registry.example/repo@sha256:"+digest {
 		t.Fatalf("valid lookup=%+v err=%v", got, err)
@@ -36,14 +37,16 @@ func TestDecodeImportRefererLookupRequiresDigestSubject(t *testing.T) {
 		t.Fatalf("supported import ref = %q, want %q", ref, got.Subject)
 	}
 	for _, raw := range []string{
-		`{"supported":true,"subject":"registry.example/repo:latest"}`,
-		`{"supported":true,"subject":""}`,
+		fmt.Sprintf(`{"conversion_semantics":%q,"supported":true,"subject":"registry.example/repo:latest"}`, image.ConversionSemantics),
+		fmt.Sprintf(`{"conversion_semantics":%q,"supported":true,"subject":""}`, image.ConversionSemantics),
+		fmt.Sprintf(`{"supported":true,"hit":true,"subject":"registry.example/repo@sha256:%s"}`, digest),
+		fmt.Sprintf(`{"conversion_semantics":"older-policy","supported":true,"hit":true,"subject":"registry.example/repo@sha256:%s"}`, digest),
 	} {
 		if _, err := decodeImportRefererLookup([]byte(raw)); err == nil {
 			t.Fatalf("accepted mutable/empty supported subject: %s", raw)
 		}
 	}
-	if got, err := decodeImportRefererLookup([]byte(`{"supported":false,"subject":""}`)); err != nil || got.Supported {
+	if got, err := decodeImportRefererLookup([]byte(fmt.Sprintf(`{"conversion_semantics":%q,"supported":false,"subject":""}`, image.ConversionSemantics))); err != nil || got.Supported {
 		t.Fatalf("unsupported lookup=%+v err=%v", got, err)
 	} else if ref := importSourceReference("registry.example/repo:latest", got); ref != "registry.example/repo:latest" {
 		t.Fatalf("unsupported import ref = %q", ref)

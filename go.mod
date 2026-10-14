@@ -14,7 +14,7 @@ require (
 	github.com/google/go-containerregistry v0.20.6
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/memberlist v0.5.4
-	github.com/kuasar-sandbox/accelerator v0.1.7-0.20261012120417-8d009c28337b
+	github.com/kuasar-sandbox/accelerator v0.1.7-preview.20261013.0.20261014005452-b736dee899eb
 	github.com/kuasar-sandbox/connector v0.1.2
 	github.com/kuasar-sandbox/sandboxer v0.1.3
 	github.com/oklog/ulid/v2 v2.1.1
