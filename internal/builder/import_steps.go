@@ -485,30 +485,26 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, sess *envdExec, c *stepCtx, 
 
 // ensureStepUser realizes the e2b set_user execution semantics inside the
 // build sandbox: the account a USER step names is resolved there and created
-// (home + bash, password locked, requested group as primary) when missing,
-// so a USER step cannot pin a config User that no passwd entry backs and
-// later RUN steps see the account they are asked to run as. Only the account
-// part of a "user[:group]" identity participates — getent and useradd take
-// a login name, while the full identity stays in the accumulated context
-// and the final config; a group suffix that survives validation becomes the
-// created account's primary group. Numeric uid references and names outside
-// the portable account charset stay pure identity switches (resolved at
-// exec time, or rejected by RUN exactly as before this path existed), so no
-// build input is ever shell-interpreted here. Root runs both probes in a
-// non-login shell with a fixed trusted PATH (neither the accumulated ENV
-// nor image-owned profiles may shadow account maintenance); an existing
-// account changes nothing.
+// (home + bash, password locked — e2b's exact command) when missing, so a
+// USER step cannot pin a config User that no passwd entry backs and later
+// RUN steps see the account they are asked to run as. Only the account part
+// of a "user[:group]" identity participates — getent and useradd take a
+// login name, while the full identity stays in the accumulated context and
+// the final config; the group suffix is deliberately config-only (e2b's
+// set_user fails on user:group forms outright, Docker's USER never creates
+// groups, and the exec channel's Basic auth cannot transport a group).
+// Numeric uid references and names outside the portable account charset
+// stay pure identity switches (resolved at exec time, or rejected by RUN
+// exactly as before this path existed), so no build input is ever
+// shell-interpreted here. Root runs both probes in a non-login shell with
+// a fixed trusted PATH (neither the accumulated ENV nor image-owned
+// profiles may shadow account maintenance); an existing account changes
+// nothing.
 func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user string) error {
 	account, ok := stepUserAccount(user)
 	if !ok {
 		return nil
 	}
-	group, hasGroup := stepUserGroup(user)
-	create := "useradd --create-home --shell /bin/bash"
-	if hasGroup {
-		create += " --gid '" + group + "'"
-	}
-	create += " -- '" + account + "'"
 	// One shared wall-clock budget covers probe + creation, so a slow probe
 	// cannot double the step's time.
 	deadline := time.Now().Add(time.Duration(p.spec.Timeouts.StepSec) * time.Second)
@@ -518,7 +514,11 @@ func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user s
 		}
 		return 0, fmt.Errorf("step %d (USER %s): account maintenance consumed the step budget", i, account)
 	}
-	probeErr := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv, "getent passwd '"+account+"'", time.Until(deadline), true)
+	probeBudget, err := budget()
+	if err != nil {
+		return err
+	}
+	probeErr := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv, "getent passwd '"+account+"'", probeBudget, true)
 	if probeErr == nil {
 		return nil
 	}
@@ -535,32 +535,13 @@ func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user s
 	if probeExit.code != 2 {
 		return fmt.Errorf("step %d (USER %s): account probe failed: %w", i, account, probeErr)
 	}
-	// A numeric gid is self-contained: Docker identities do not require a
-	// group entry for it, but useradd --gid does — arrange one (named after
-	// the account) when the gid has no group. A named group must already
-	// exist; useradd resolves it and fails clearly otherwise, matching
-	// Docker's requirement for the named form.
-	if hasGroup && stepGroupNumeric(group) {
-		gerr := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv, "getent group '"+group+"'", time.Until(deadline), true)
-		var gexit *exitError
-		if gerr != nil && errors.As(gerr, &gexit) && gexit.code == 2 {
-			gbudget, err := budget()
-			if err != nil {
-				return err
-			}
-			p.progress("step %d: USER %s (group %s missing, creating)", i, account, group)
-			if err := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv,
-				"groupadd --gid '"+group+"' '"+account+"'", gbudget, false); err != nil {
-				return fmt.Errorf("step %d (USER %s): create group %s: %w", i, account, group, err)
-			}
-		}
-	}
-	remaining, err := budget()
+	createBudget, err := budget()
 	if err != nil {
 		return err
 	}
 	p.progress("step %d: USER %s (missing, creating)", i, account)
-	if err := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv, create, remaining, false); err != nil {
+	if err := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv,
+		"useradd --create-home --shell /bin/bash -- '"+account+"'", createBudget, false); err != nil {
 		return fmt.Errorf("step %d (USER %s): create missing user: %w", i, account, err)
 	}
 	return nil
@@ -576,7 +557,7 @@ var stepAccountEnv = map[string]string{
 // stepUserAccount extracts the login a USER step must guarantee from its
 // identity argument: the part before the first ":" of a "user[:group]"
 // form, when that part names an account — it must start with a letter or
-// underscore and use only the portable charset id/useradd accept, which
+// underscore and use only the portable charset getent/useradd accept, which
 // also rules out shell metacharacters and option-looking operands. ok=false
 // marks every identity that stays a pure switch: numeric uid references
 // ("uid[:gid]") and non-portable names.
@@ -588,34 +569,7 @@ func stepUserAccount(user string) (string, bool) {
 	return account, true
 }
 
-// stepUserGroup extracts a validated group reference (name or numeric gid)
-// from the ":" suffix of a USER identity, when one is present.
-func stepUserGroup(user string) (string, bool) {
-	_, group, hasGroup := strings.Cut(user, ":")
-	if !hasGroup || group == "" || !stepGroupPattern.MatchString(group) {
-		return "", false
-	}
-	return group, true
-}
-
-// stepGroupNumeric reports whether a validated group reference is a bare
-// numeric gid — a self-contained identity that carries no name to resolve.
-func stepGroupNumeric(group string) bool {
-	if group == "" {
-		return false
-	}
-	for _, r := range group {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-var (
-	stepAccountPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9._-]*$`)
-	stepGroupPattern   = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._-]*$`)
-)
+var stepAccountPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9._-]*$`)
 
 // applyCopy realizes a COPY/ADD step: fetch the context tar (presigned GET,
 // platform plumbing — host-side, no guest), then stream it through

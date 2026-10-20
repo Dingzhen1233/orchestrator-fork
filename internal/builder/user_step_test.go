@@ -25,7 +25,6 @@ import (
 type fakeStepEnvd struct {
 	addr       string
 	existing   map[string]bool
-	groups     map[string]bool
 	failCmd    string // command prefix that exits non-zero
 	breakProbe bool   // abort the connection mid-probe (inconclusive outcome)
 	idMissExit int    // exit code the probe uses for a missing account
@@ -47,10 +46,8 @@ func (f *fakeStepEnvd) recorded() []fakeStepEnvdCall {
 }
 
 var (
-	fakeProbe    = regexp.MustCompile(`^getent passwd '([^']+)'$`)
-	fakeGroup    = regexp.MustCompile(`^getent group '([^']+)'$`)
-	fakeUseradd  = regexp.MustCompile(`^useradd --create-home --shell /bin/bash(?: --gid '([^']+)')? -- '([^']+)'$`)
-	fakeGroupadd = regexp.MustCompile(`^groupadd --gid '([^']+)' '([^']+)'$`)
+	fakeProbe   = regexp.MustCompile(`^getent passwd '([^']+)'$`)
+	fakeUseradd = regexp.MustCompile(`^useradd --create-home --shell /bin/bash(?: --gid '([^']+)')? -- '([^']+)'$`)
 )
 
 const (
@@ -58,7 +55,7 @@ const (
 	accountAdd   = "useradd --create-home --shell /bin/bash -- 'app'"
 )
 
-func startFakeStepEnvd(t *testing.T, existing, groups []string, failCmd string, breakProbe bool, idMissExit int) *fakeStepEnvd {
+func startFakeStepEnvd(t *testing.T, existing []string, failCmd string, breakProbe bool, idMissExit int) *fakeStepEnvd {
 	t.Helper()
 	if idMissExit == 0 {
 		idMissExit = 2
@@ -68,14 +65,11 @@ func startFakeStepEnvd(t *testing.T, existing, groups []string, failCmd string, 
 		t.Fatal(err)
 	}
 	f := &fakeStepEnvd{
-		addr: ln.Addr().String(), existing: map[string]bool{}, groups: map[string]bool{},
+		addr: ln.Addr().String(), existing: map[string]bool{},
 		failCmd: failCmd, breakProbe: breakProbe, idMissExit: idMissExit,
 	}
 	for _, u := range existing {
 		f.existing[u] = true
-	}
-	for _, g := range groups {
-		f.groups[g] = true
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /process.Process/Start", func(w http.ResponseWriter, r *http.Request) {
@@ -120,10 +114,6 @@ func startFakeStepEnvd(t *testing.T, existing, groups []string, failCmd string, 
 			if !f.existing[m[1]] {
 				exit = f.idMissExit
 			}
-		} else if m := fakeGroup.FindStringSubmatch(cmd); m != nil {
-			if !f.groups[m[1]] {
-				exit = 2
-			}
 		} else if m := fakeUseradd.FindStringSubmatch(cmd); m != nil {
 			if failCmd != "" && strings.HasPrefix(cmd, failCmd) {
 				exit = 1
@@ -132,10 +122,6 @@ func startFakeStepEnvd(t *testing.T, existing, groups []string, failCmd string, 
 				f.existing[m[2]] = true
 				f.mu.Unlock()
 			}
-		} else if m := fakeGroupadd.FindStringSubmatch(cmd); m != nil {
-			f.mu.Lock()
-			f.groups[m[1]] = true
-			f.mu.Unlock()
 		}
 		writeStepEnvdFrame(w, 0, []byte(`{"event":{"start":{"pid":42}}}`))
 		if exit != 0 {
@@ -165,7 +151,6 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 		name        string
 		user        string
 		existing    []string
-		groups      []string
 		failCmd     string
 		breakProbe  bool
 		idMissExit  int
@@ -215,29 +200,11 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 			wantCalls: []string{accountProbe}, wantContext: "app:staff",
 		},
 		{
-			name: "numeric gid form arranges the missing group",
-			user: "app:424242",
-			wantCalls: []string{
-				accountProbe,
-				"getent group '424242'",
-				"groupadd --gid '424242' 'app'",
-				"useradd --create-home --shell /bin/bash --gid '424242' -- 'app'",
-			},
-			wantContext: "app:424242",
-		},
-		{
-			name: "numeric gid form skips arrangement for existing group", user: "app:424242", groups: []string{"424242"},
-			wantCalls: []string{
-				accountProbe,
-				"getent group '424242'",
-				"useradd --create-home --shell /bin/bash --gid '424242' -- 'app'",
-			},
-			wantContext: "app:424242",
-		},
-		{
-			name:        "group name form creates with the named group",
+			// The group suffix stays config-only: the account part is what
+			// gets guaranteed, with e2b's exact creation command.
+			name:        "group suffix form creates the account part only",
 			user:        "app:staff",
-			wantCalls:   []string{accountProbe, "useradd --create-home --shell /bin/bash --gid 'staff' -- 'app'"},
+			wantCalls:   []string{accountProbe, accountAdd},
 			wantContext: "app:staff",
 		},
 		{name: "uid:gid stays a pure identity switch", user: "1000:1000", wantContext: "1000:1000"},
@@ -252,7 +219,7 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 		{name: "option-looking operand stays off the probe", user: "--help", wantContext: "--help"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			f := startFakeStepEnvd(t, test.existing, test.groups, test.failCmd, test.breakProbe, test.idMissExit)
+			f := startFakeStepEnvd(t, test.existing, test.failCmd, test.breakProbe, test.idMissExit)
 			p := &buildPipeline{
 				ctx:  context.Background(),
 				spec: &configsock.BuildSpec{Timeouts: configsock.BuildTimeouts{StepSec: 5}},
