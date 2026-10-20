@@ -205,9 +205,20 @@ func (e *envdExec) run(ctx context.Context, user, cwd string, env map[string]str
 		return fmt.Errorf("envd: stream ended before the command exited")
 	}
 	if exit != 0 {
-		return fmt.Errorf("exit status %d (%s)", exit, lastLine(tail.Bytes()))
+		return &exitError{code: int(exit), tail: lastLine(tail.Bytes())}
 	}
 	return nil
+}
+
+// exitError marks a command that ran to a definite non-zero exit, as opposed
+// to transport/stream/deadline failures that leave the outcome unknown.
+type exitError struct {
+	code int
+	tail string
+}
+
+func (e *exitError) Error() string {
+	return fmt.Sprintf("exit status %d (%s)", e.code, e.tail)
 }
 
 // startedCmd is a start command held open the way e2b's template build

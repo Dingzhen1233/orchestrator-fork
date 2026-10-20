@@ -21,11 +21,12 @@ import (
 // it records each call's Basic-auth user and command, scripting the `id -u`
 // probes (account existence) and `useradd` outcomes the USER step performs.
 type fakeStepEnvd struct {
-	addr     string
-	existing map[string]bool
-	failCmd  string // command prefix that exits non-zero
-	mu       sync.Mutex
-	calls    []fakeStepEnvdCall
+	addr       string
+	existing   map[string]bool
+	failCmd    string // command prefix that exits non-zero
+	breakProbe bool   // abort the connection mid-probe (inconclusive outcome)
+	mu         sync.Mutex
+	calls      []fakeStepEnvdCall
 }
 
 type fakeStepEnvdCall struct {
@@ -46,13 +47,13 @@ var (
 	accountAdd   = "useradd --create-home --shell /bin/bash -- 'app'"
 )
 
-func startFakeStepEnvd(t *testing.T, existing []string, failCmd string) *fakeStepEnvd {
+func startFakeStepEnvd(t *testing.T, existing []string, failCmd string, breakProbe bool) *fakeStepEnvd {
 	t.Helper()
 	ln, err := net.Listen("unix", filepath.Join(t.TempDir(), "envd.sock"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeStepEnvd{addr: ln.Addr().String(), existing: map[string]bool{}, failCmd: failCmd}
+	f := &fakeStepEnvd{addr: ln.Addr().String(), existing: map[string]bool{}, failCmd: failCmd, breakProbe: breakProbe}
 	for _, u := range existing {
 		f.existing[u] = true
 	}
@@ -86,6 +87,12 @@ func startFakeStepEnvd(t *testing.T, existing []string, failCmd string) *fakeSte
 		f.calls = append(f.calls, fakeStepEnvdCall{user: user, cmd: cmd})
 		f.mu.Unlock()
 
+		if f.breakProbe && fakeIDProbe.MatchString(cmd) {
+			// Deliver a start event, then drop the connection: the client
+			// sees a stream error, not a definite exit.
+			writeStepEnvdFrame(w, 0, []byte(`{"event":{"start":{"pid":42}}}`))
+			panic(http.ErrAbortHandler)
+		}
 		exit := 0
 		if m := fakeIDProbe.FindStringSubmatch(cmd); m != nil {
 			if !f.existing[m[1]] {
@@ -126,6 +133,7 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 		user        string
 		existing    []string
 		failCmd     string
+		breakProbe  bool
 		wantErr     string
 		wantCalls   []string
 		wantContext string
@@ -143,6 +151,14 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 			name: "creation failure fails the step", user: "app", failCmd: "useradd",
 			wantErr:   "create missing user",
 			wantCalls: []string{accountProbe, accountAdd},
+		},
+		{
+			// A probe that ends without a definite exit (transport/stream
+			// failure) must not be read as "account missing": creation only
+			// follows a conclusive not-found.
+			name: "inconclusive probe fails without creating", user: "app", breakProbe: true,
+			wantErr:   "inconclusive",
+			wantCalls: []string{accountProbe},
 		},
 		{
 			// user:group keeps the full identity in the context while the
@@ -167,7 +183,7 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 		{name: "option-looking operand stays off the probe", user: "--help", wantContext: "--help"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			f := startFakeStepEnvd(t, test.existing, test.failCmd)
+			f := startFakeStepEnvd(t, test.existing, test.failCmd, test.breakProbe)
 			p := &buildPipeline{
 				ctx:  context.Background(),
 				spec: &configsock.BuildSpec{Timeouts: configsock.BuildTimeouts{StepSec: 5}},

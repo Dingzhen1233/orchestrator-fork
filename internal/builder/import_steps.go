@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -498,13 +499,27 @@ func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user s
 	if !ok {
 		return nil
 	}
-	stepBudget := time.Duration(p.spec.Timeouts.StepSec) * time.Second
-	if err := sess.run(p.ctx, "root", "/", c.env, "id -u -- '"+account+"'", stepBudget, true); err == nil {
+	// One shared wall-clock budget covers probe + creation, so a slow probe
+	// cannot double the step's time.
+	deadline := time.Now().Add(time.Duration(p.spec.Timeouts.StepSec) * time.Second)
+	probeErr := sess.run(p.ctx, "root", "/", c.env, "id -u -- '"+account+"'", time.Until(deadline), true)
+	if probeErr == nil {
 		return nil
+	}
+	// Create only on a definite not-found (the probe exited non-zero).
+	// Transport, deadline, and stream failures leave the outcome unknown —
+	// creating then could mutate /etc/passwd after an inconclusive probe.
+	var probeExit *exitError
+	if !errors.As(probeErr, &probeExit) {
+		return fmt.Errorf("step %d (USER %s): account probe inconclusive: %w", i, account, probeErr)
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return fmt.Errorf("step %d (USER %s): account probe consumed the step budget", i, account)
 	}
 	p.progress("step %d: USER %s (missing, creating)", i, account)
 	if err := sess.run(p.ctx, "root", "/", c.env,
-		"useradd --create-home --shell /bin/bash -- '"+account+"'", stepBudget, false); err != nil {
+		"useradd --create-home --shell /bin/bash -- '"+account+"'", remaining, false); err != nil {
 		return fmt.Errorf("step %d (USER %s): create missing user: %w", i, account, err)
 	}
 	return nil
