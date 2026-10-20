@@ -503,14 +503,21 @@ func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user s
 	if !ok {
 		return nil
 	}
+	group, hasGroup := stepUserGroup(user)
 	create := "useradd --create-home --shell /bin/bash"
-	if group, ok := stepUserGroup(user); ok {
+	if hasGroup {
 		create += " --gid '" + group + "'"
 	}
 	create += " -- '" + account + "'"
 	// One shared wall-clock budget covers probe + creation, so a slow probe
 	// cannot double the step's time.
 	deadline := time.Now().Add(time.Duration(p.spec.Timeouts.StepSec) * time.Second)
+	budget := func() (time.Duration, error) {
+		if d := time.Until(deadline); d > 0 {
+			return d, nil
+		}
+		return 0, fmt.Errorf("step %d (USER %s): account maintenance consumed the step budget", i, account)
+	}
 	probeErr := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv, "getent passwd '"+account+"'", time.Until(deadline), true)
 	if probeErr == nil {
 		return nil
@@ -528,9 +535,29 @@ func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user s
 	if probeExit.code != 2 {
 		return fmt.Errorf("step %d (USER %s): account probe failed: %w", i, account, probeErr)
 	}
-	remaining := time.Until(deadline)
-	if remaining <= 0 {
-		return fmt.Errorf("step %d (USER %s): account probe consumed the step budget", i, account)
+	// A numeric gid is self-contained: Docker identities do not require a
+	// group entry for it, but useradd --gid does — arrange one (named after
+	// the account) when the gid has no group. A named group must already
+	// exist; useradd resolves it and fails clearly otherwise, matching
+	// Docker's requirement for the named form.
+	if hasGroup && stepGroupNumeric(group) {
+		gerr := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv, "getent group '"+group+"'", time.Until(deadline), true)
+		var gexit *exitError
+		if gerr != nil && errors.As(gerr, &gexit) && gexit.code == 2 {
+			gbudget, err := budget()
+			if err != nil {
+				return err
+			}
+			p.progress("step %d: USER %s (group %s missing, creating)", i, account, group)
+			if err := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv,
+				"groupadd --gid '"+group+"' '"+account+"'", gbudget, false); err != nil {
+				return fmt.Errorf("step %d (USER %s): create group %s: %w", i, account, group, err)
+			}
+		}
+	}
+	remaining, err := budget()
+	if err != nil {
+		return err
 	}
 	p.progress("step %d: USER %s (missing, creating)", i, account)
 	if err := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv, create, remaining, false); err != nil {
@@ -569,6 +596,20 @@ func stepUserGroup(user string) (string, bool) {
 		return "", false
 	}
 	return group, true
+}
+
+// stepGroupNumeric reports whether a validated group reference is a bare
+// numeric gid — a self-contained identity that carries no name to resolve.
+func stepGroupNumeric(group string) bool {
+	if group == "" {
+		return false
+	}
+	for _, r := range group {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 var (
