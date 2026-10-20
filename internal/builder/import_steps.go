@@ -464,7 +464,11 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, sess *envdExec, c *stepCtx, 
 		}
 	case "USER":
 		if len(st.Args) > 0 {
-			c.user = sub(st.Args[0])
+			user := sub(st.Args[0])
+			if err := p.ensureStepUser(sess, c, i, user); err != nil {
+				return err
+			}
+			c.user = user
 			p.progress("step %d: USER %s", i, c.user)
 		}
 	case "COPY", "ADD":
@@ -475,6 +479,46 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, sess *envdExec, c *stepCtx, 
 		return fmt.Errorf("step %d: unsupported type %q", i, st.Type)
 	}
 	return nil
+}
+
+// ensureStepUser realizes the e2b set_user execution semantics inside the
+// build sandbox: an account name is resolved there and created (home + bash,
+// password locked) when missing, so a USER step cannot pin a config User
+// that no passwd entry backs and later RUN steps see the account they are
+// asked to run as. Numeric "uid[:gid]" arguments stay pure identity switches
+// — they are resolved at exec time by uid and cannot be expressed by
+// useradd. Root runs both probes; an existing account changes nothing.
+func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user string) error {
+	if user == "" || stepUserIsNumeric(user) {
+		return nil
+	}
+	stepBudget := time.Duration(p.spec.Timeouts.StepSec) * time.Second
+	if err := sess.run(p.ctx, "root", "/", c.env, "id -u "+user, stepBudget, true); err == nil {
+		return nil
+	}
+	p.progress("step %d: USER %s (missing, creating)", i, user)
+	if err := sess.run(p.ctx, "root", "/", c.env,
+		"useradd --create-home --shell /bin/bash "+user, stepBudget, false); err != nil {
+		return fmt.Errorf("step %d (USER %s): create missing user: %w", i, user, err)
+	}
+	return nil
+}
+
+// stepUserIsNumeric reports whether a USER argument is a "uid[:gid]" form
+// (all of its colon-separated parts are digits), as opposed to an account
+// name.
+func stepUserIsNumeric(user string) bool {
+	for _, part := range strings.Split(user, ":") {
+		if part == "" {
+			return false
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // applyCopy realizes a COPY/ADD step: fetch the context tar (presigned GET,
