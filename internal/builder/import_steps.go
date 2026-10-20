@@ -488,15 +488,16 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, sess *envdExec, c *stepCtx, 
 // (home + bash, password locked, requested group as primary) when missing,
 // so a USER step cannot pin a config User that no passwd entry backs and
 // later RUN steps see the account they are asked to run as. Only the account
-// part of a "user[:group]" identity participates — id and useradd take a
-// login name, while the full identity stays in the accumulated context and
-// the final config; a group suffix that survives validation becomes the
+// part of a "user[:group]" identity participates — getent and useradd take
+// a login name, while the full identity stays in the accumulated context
+// and the final config; a group suffix that survives validation becomes the
 // created account's primary group. Numeric uid references and names outside
 // the portable account charset stay pure identity switches (resolved at
 // exec time, or rejected by RUN exactly as before this path existed), so no
-// build input is ever shell-interpreted here. Root runs both probes with a
-// fixed trusted PATH (the accumulated ENV must not shadow account
-// maintenance); an existing account changes nothing.
+// build input is ever shell-interpreted here. Root runs both probes in a
+// non-login shell with a fixed trusted PATH (neither the accumulated ENV
+// nor image-owned profiles may shadow account maintenance); an existing
+// account changes nothing.
 func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user string) error {
 	account, ok := stepUserAccount(user)
 	if !ok {
@@ -510,20 +511,21 @@ func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user s
 	// One shared wall-clock budget covers probe + creation, so a slow probe
 	// cannot double the step's time.
 	deadline := time.Now().Add(time.Duration(p.spec.Timeouts.StepSec) * time.Second)
-	probeErr := sess.run(p.ctx, "root", "/", stepAccountEnv, "id -u -- '"+account+"'", time.Until(deadline), true)
+	probeErr := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv, "getent passwd '"+account+"'", time.Until(deadline), true)
 	if probeErr == nil {
 		return nil
 	}
-	// Create only on a definite lookup miss: id exits 1 exactly for "no
-	// such user". Transport, deadline, and stream failures leave the
-	// outcome unknown, and other exits (127 command not found, signals,
-	// usage errors) mean the probe itself is broken — neither may turn into
-	// a passwd mutation.
+	// Create only on a definite lookup miss: getent exits 2 exactly for a
+	// key absent from the passwd database, and 0 when present. Transport,
+	// deadline, and stream failures leave the outcome unknown, and other
+	// exits (127 command not found, NSS operational errors, signals) mean
+	// the lookup itself is broken — neither may turn into a passwd
+	// mutation.
 	var probeExit *exitError
 	if !errors.As(probeErr, &probeExit) {
 		return fmt.Errorf("step %d (USER %s): account probe inconclusive: %w", i, account, probeErr)
 	}
-	if probeExit.code != 1 {
+	if probeExit.code != 2 {
 		return fmt.Errorf("step %d (USER %s): account probe failed: %w", i, account, probeErr)
 	}
 	remaining := time.Until(deadline)
@@ -531,7 +533,7 @@ func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user s
 		return fmt.Errorf("step %d (USER %s): account probe consumed the step budget", i, account)
 	}
 	p.progress("step %d: USER %s (missing, creating)", i, account)
-	if err := sess.run(p.ctx, "root", "/", stepAccountEnv, create, remaining, false); err != nil {
+	if err := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv, create, remaining, false); err != nil {
 		return fmt.Errorf("step %d (USER %s): create missing user: %w", i, account, err)
 	}
 	return nil

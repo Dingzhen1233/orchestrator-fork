@@ -27,15 +27,16 @@ type fakeStepEnvd struct {
 	existing   map[string]bool
 	failCmd    string // command prefix that exits non-zero
 	breakProbe bool   // abort the connection mid-probe (inconclusive outcome)
-	idMissExit int    // exit code the id probe uses for a missing account
+	idMissExit int    // exit code the probe uses for a missing account
 	mu         sync.Mutex
 	calls      []fakeStepEnvdCall
 }
 
 type fakeStepEnvdCall struct {
-	user string
-	cmd  string
-	path string
+	user      string
+	cmd       string
+	path      string
+	noprofile bool
 }
 
 func (f *fakeStepEnvd) recorded() []fakeStepEnvdCall {
@@ -45,19 +46,19 @@ func (f *fakeStepEnvd) recorded() []fakeStepEnvdCall {
 }
 
 var (
-	fakeIDProbe = regexp.MustCompile(`^id -u -- '([^']+)'$`)
+	fakeProbe   = regexp.MustCompile(`^getent passwd '([^']+)'$`)
 	fakeUseradd = regexp.MustCompile(`^useradd --create-home --shell /bin/bash(?: --gid '([^']+)')? -- '([^']+)'$`)
 )
 
 const (
-	accountProbe = "id -u -- 'app'"
+	accountProbe = "getent passwd 'app'"
 	accountAdd   = "useradd --create-home --shell /bin/bash -- 'app'"
 )
 
 func startFakeStepEnvd(t *testing.T, existing []string, failCmd string, breakProbe bool, idMissExit int) *fakeStepEnvd {
 	t.Helper()
 	if idMissExit == 0 {
-		idMissExit = 1
+		idMissExit = 2
 	}
 	ln, err := net.Listen("unix", filepath.Join(t.TempDir(), "envd.sock"))
 	if err != nil {
@@ -93,22 +94,23 @@ func startFakeStepEnvd(t *testing.T, existing []string, failCmd string, breakPro
 			return
 		}
 		user, _, _ := r.BasicAuth()
-		cmd := ""
+		cmd, noprofile := "", false
 		if len(req.Process.Args) > 0 {
 			cmd = req.Process.Args[len(req.Process.Args)-1]
+			noprofile = req.Process.Args[0] == "--noprofile"
 		}
 		f.mu.Lock()
-		f.calls = append(f.calls, fakeStepEnvdCall{user: user, cmd: cmd, path: req.Process.Envs["PATH"]})
+		f.calls = append(f.calls, fakeStepEnvdCall{user: user, cmd: cmd, path: req.Process.Envs["PATH"], noprofile: noprofile})
 		f.mu.Unlock()
 
-		if f.breakProbe && fakeIDProbe.MatchString(cmd) {
+		if f.breakProbe && fakeProbe.MatchString(cmd) {
 			// Deliver a start event, then drop the connection: the client
 			// sees a stream error, not a definite exit.
 			writeStepEnvdFrame(w, 0, []byte(`{"event":{"start":{"pid":42}}}`))
 			panic(http.ErrAbortHandler)
 		}
 		exit := 0
-		if m := fakeIDProbe.FindStringSubmatch(cmd); m != nil {
+		if m := fakeProbe.FindStringSubmatch(cmd); m != nil {
 			if !f.existing[m[1]] {
 				exit = f.idMissExit
 			}
@@ -179,9 +181,15 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 			wantCalls: []string{accountProbe},
 		},
 		{
-			// id exits 1 exactly for a lookup miss; other exits mean the
-			// probe itself is broken and must not trigger creation.
-			name: "abnormal probe exit fails without creating", user: "app", idMissExit: 127,
+			// getent exits 2 exactly for a key miss; an NSS operational
+			// error (exit 1) leaves existence unknown and must not trigger
+			// creation.
+			name: "nss error exit fails without creating", user: "app", idMissExit: 1,
+			wantErr:   "account probe failed",
+			wantCalls: []string{accountProbe},
+		},
+		{
+			name: "missing tool exit fails without creating", user: "app", idMissExit: 127,
 			wantErr:   "account probe failed",
 			wantCalls: []string{accountProbe},
 		},
@@ -239,6 +247,9 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 				}
 				if strings.Contains(call.path, "/opt/shadow") {
 					t.Fatalf("USER step probe PATH %q inherited the image-supplied PATH", call.path)
+				}
+				if !call.noprofile {
+					t.Fatalf("USER step probe ran in a login shell (%q); account maintenance must skip profiles", call.cmd)
 				}
 				if !strings.Contains(call.path, "/usr/sbin") {
 					t.Fatalf("USER step probe PATH %q lacks the trusted directories", call.path)
