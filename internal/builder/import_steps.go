@@ -485,44 +485,63 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, sess *envdExec, c *stepCtx, 
 
 // ensureStepUser realizes the e2b set_user execution semantics inside the
 // build sandbox: the account a USER step names is resolved there and created
-// (home + bash, password locked) when missing, so a USER step cannot pin a
-// config User that no passwd entry backs and later RUN steps see the account
-// they are asked to run as. Only the account part of a "user[:group]"
-// identity participates — id and useradd take a login name, while the full
-// identity stays in the accumulated context and the final config. Numeric
-// uid references and names outside the portable account charset stay pure
-// identity switches (resolved at exec time, or rejected by RUN exactly as
-// before this path existed), so no build input is ever shell-interpreted
-// here. Root runs both probes; an existing account changes nothing.
+// (home + bash, password locked, requested group as primary) when missing,
+// so a USER step cannot pin a config User that no passwd entry backs and
+// later RUN steps see the account they are asked to run as. Only the account
+// part of a "user[:group]" identity participates — id and useradd take a
+// login name, while the full identity stays in the accumulated context and
+// the final config; a group suffix that survives validation becomes the
+// created account's primary group. Numeric uid references and names outside
+// the portable account charset stay pure identity switches (resolved at
+// exec time, or rejected by RUN exactly as before this path existed), so no
+// build input is ever shell-interpreted here. Root runs both probes with a
+// fixed trusted PATH (the accumulated ENV must not shadow account
+// maintenance); an existing account changes nothing.
 func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user string) error {
 	account, ok := stepUserAccount(user)
 	if !ok {
 		return nil
 	}
+	create := "useradd --create-home --shell /bin/bash"
+	if group, ok := stepUserGroup(user); ok {
+		create += " --gid '" + group + "'"
+	}
+	create += " -- '" + account + "'"
 	// One shared wall-clock budget covers probe + creation, so a slow probe
 	// cannot double the step's time.
 	deadline := time.Now().Add(time.Duration(p.spec.Timeouts.StepSec) * time.Second)
-	probeErr := sess.run(p.ctx, "root", "/", c.env, "id -u -- '"+account+"'", time.Until(deadline), true)
+	probeErr := sess.run(p.ctx, "root", "/", stepAccountEnv, "id -u -- '"+account+"'", time.Until(deadline), true)
 	if probeErr == nil {
 		return nil
 	}
-	// Create only on a definite not-found (the probe exited non-zero).
-	// Transport, deadline, and stream failures leave the outcome unknown —
-	// creating then could mutate /etc/passwd after an inconclusive probe.
+	// Create only on a definite lookup miss: id exits 1 exactly for "no
+	// such user". Transport, deadline, and stream failures leave the
+	// outcome unknown, and other exits (127 command not found, signals,
+	// usage errors) mean the probe itself is broken — neither may turn into
+	// a passwd mutation.
 	var probeExit *exitError
 	if !errors.As(probeErr, &probeExit) {
 		return fmt.Errorf("step %d (USER %s): account probe inconclusive: %w", i, account, probeErr)
+	}
+	if probeExit.code != 1 {
+		return fmt.Errorf("step %d (USER %s): account probe failed: %w", i, account, probeErr)
 	}
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		return fmt.Errorf("step %d (USER %s): account probe consumed the step budget", i, account)
 	}
 	p.progress("step %d: USER %s (missing, creating)", i, account)
-	if err := sess.run(p.ctx, "root", "/", c.env,
-		"useradd --create-home --shell /bin/bash -- '"+account+"'", remaining, false); err != nil {
+	if err := sess.run(p.ctx, "root", "/", stepAccountEnv, create, remaining, false); err != nil {
 		return fmt.Errorf("step %d (USER %s): create missing user: %w", i, account, err)
 	}
 	return nil
+}
+
+// stepAccountEnv is the fixed environment account maintenance runs with:
+// the accumulated build ENV (an image-supplied PATH in particular) must not
+// influence which id/useradd the probes execute.
+var stepAccountEnv = map[string]string{
+	"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 }
 
 // stepUserAccount extracts the login a USER step must guarantee from its
@@ -540,7 +559,20 @@ func stepUserAccount(user string) (string, bool) {
 	return account, true
 }
 
-var stepAccountPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9._-]*$`)
+// stepUserGroup extracts a validated group reference (name or numeric gid)
+// from the ":" suffix of a USER identity, when one is present.
+func stepUserGroup(user string) (string, bool) {
+	_, group, hasGroup := strings.Cut(user, ":")
+	if !hasGroup || group == "" || !stepGroupPattern.MatchString(group) {
+		return "", false
+	}
+	return group, true
+}
+
+var (
+	stepAccountPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9._-]*$`)
+	stepGroupPattern   = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._-]*$`)
+)
 
 // applyCopy realizes a COPY/ADD step: fetch the context tar (presigned GET,
 // platform plumbing — host-side, no guest), then stream it through

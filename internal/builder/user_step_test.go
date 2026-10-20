@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -18,13 +19,15 @@ import (
 )
 
 // fakeStepEnvd answers the builder's envd process.Start surface over a UDS:
-// it records each call's Basic-auth user and command, scripting the `id -u`
-// probes (account existence) and `useradd` outcomes the USER step performs.
+// it records each call's Basic-auth user, command, and PATH, scripting the
+// `id -u` probes (account existence) and `useradd` outcomes the USER step
+// performs.
 type fakeStepEnvd struct {
 	addr       string
 	existing   map[string]bool
 	failCmd    string // command prefix that exits non-zero
 	breakProbe bool   // abort the connection mid-probe (inconclusive outcome)
+	idMissExit int    // exit code the id probe uses for a missing account
 	mu         sync.Mutex
 	calls      []fakeStepEnvdCall
 }
@@ -32,6 +35,7 @@ type fakeStepEnvd struct {
 type fakeStepEnvdCall struct {
 	user string
 	cmd  string
+	path string
 }
 
 func (f *fakeStepEnvd) recorded() []fakeStepEnvdCall {
@@ -41,19 +45,28 @@ func (f *fakeStepEnvd) recorded() []fakeStepEnvdCall {
 }
 
 var (
-	fakeIDProbe  = regexp.MustCompile(`^id -u -- '([^']+)'$`)
-	fakeUseradd  = regexp.MustCompile(`^useradd --create-home --shell /bin/bash -- '([^']+)'$`)
+	fakeIDProbe = regexp.MustCompile(`^id -u -- '([^']+)'$`)
+	fakeUseradd = regexp.MustCompile(`^useradd --create-home --shell /bin/bash(?: --gid '([^']+)')? -- '([^']+)'$`)
+)
+
+const (
 	accountProbe = "id -u -- 'app'"
 	accountAdd   = "useradd --create-home --shell /bin/bash -- 'app'"
 )
 
-func startFakeStepEnvd(t *testing.T, existing []string, failCmd string, breakProbe bool) *fakeStepEnvd {
+func startFakeStepEnvd(t *testing.T, existing []string, failCmd string, breakProbe bool, idMissExit int) *fakeStepEnvd {
 	t.Helper()
+	if idMissExit == 0 {
+		idMissExit = 1
+	}
 	ln, err := net.Listen("unix", filepath.Join(t.TempDir(), "envd.sock"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeStepEnvd{addr: ln.Addr().String(), existing: map[string]bool{}, failCmd: failCmd, breakProbe: breakProbe}
+	f := &fakeStepEnvd{
+		addr: ln.Addr().String(), existing: map[string]bool{}, failCmd: failCmd,
+		breakProbe: breakProbe, idMissExit: idMissExit,
+	}
 	for _, u := range existing {
 		f.existing[u] = true
 	}
@@ -71,7 +84,8 @@ func startFakeStepEnvd(t *testing.T, existing []string, failCmd string, breakPro
 		}
 		var req struct {
 			Process struct {
-				Args []string `json:"args"`
+				Args []string          `json:"args"`
+				Envs map[string]string `json:"envs"`
 			} `json:"process"`
 		}
 		if err := json.Unmarshal(body, &req); err != nil {
@@ -84,7 +98,7 @@ func startFakeStepEnvd(t *testing.T, existing []string, failCmd string, breakPro
 			cmd = req.Process.Args[len(req.Process.Args)-1]
 		}
 		f.mu.Lock()
-		f.calls = append(f.calls, fakeStepEnvdCall{user: user, cmd: cmd})
+		f.calls = append(f.calls, fakeStepEnvdCall{user: user, cmd: cmd, path: req.Process.Envs["PATH"]})
 		f.mu.Unlock()
 
 		if f.breakProbe && fakeIDProbe.MatchString(cmd) {
@@ -96,20 +110,20 @@ func startFakeStepEnvd(t *testing.T, existing []string, failCmd string, breakPro
 		exit := 0
 		if m := fakeIDProbe.FindStringSubmatch(cmd); m != nil {
 			if !f.existing[m[1]] {
-				exit = 1
+				exit = f.idMissExit
 			}
 		} else if m := fakeUseradd.FindStringSubmatch(cmd); m != nil {
 			if failCmd != "" && strings.HasPrefix(cmd, failCmd) {
 				exit = 1
 			} else {
 				f.mu.Lock()
-				f.existing[m[1]] = true
+				f.existing[m[2]] = true
 				f.mu.Unlock()
 			}
 		}
 		writeStepEnvdFrame(w, 0, []byte(`{"event":{"start":{"pid":42}}}`))
 		if exit != 0 {
-			writeStepEnvdFrame(w, 0, []byte(`{"event":{"end":{"exitCode":1,"exited":true,"status":"exited"}}}`))
+			writeStepEnvdFrame(w, 0, []byte(fmt.Sprintf(`{"event":{"end":{"exitCode":%d,"exited":true,"status":"exited"}}}`, exit)))
 		} else {
 			writeStepEnvdFrame(w, 0, []byte(`{"event":{"end":{"exited":true,"status":"exited"}}}`))
 		}
@@ -128,12 +142,16 @@ func writeStepEnvdFrame(w io.Writer, flags byte, payload []byte) {
 }
 
 func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
+	// The accumulated build context carries an image-supplied PATH; account
+	// maintenance must not inherit it.
+	poison := map[string]string{"PATH": "/opt/shadow", "FROM_IMAGE": "yes"}
 	for _, test := range []struct {
 		name        string
 		user        string
 		existing    []string
 		failCmd     string
 		breakProbe  bool
+		idMissExit  int
 		wantErr     string
 		wantCalls   []string
 		wantContext string
@@ -161,15 +179,29 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 			wantCalls: []string{accountProbe},
 		},
 		{
+			// id exits 1 exactly for a lookup miss; other exits mean the
+			// probe itself is broken and must not trigger creation.
+			name: "abnormal probe exit fails without creating", user: "app", idMissExit: 127,
+			wantErr:   "account probe failed",
+			wantCalls: []string{accountProbe},
+		},
+		{
 			// user:group keeps the full identity in the context while the
 			// account part is what gets guaranteed in the sandbox.
 			name: "user group form probes the account part", user: "app:staff", existing: []string{"app"},
 			wantCalls: []string{accountProbe}, wantContext: "app:staff",
 		},
 		{
-			name:      "user group form creates the account part",
-			user:      "app:1000",
-			wantCalls: []string{accountProbe, accountAdd}, wantContext: "app:1000",
+			name:        "user group form creates the account with the group",
+			user:        "app:1000",
+			wantCalls:   []string{accountProbe, "useradd --create-home --shell /bin/bash --gid '1000' -- 'app'"},
+			wantContext: "app:1000",
+		},
+		{
+			name:        "group name form creates with the named group",
+			user:        "app:staff",
+			wantCalls:   []string{accountProbe, "useradd --create-home --shell /bin/bash --gid 'staff' -- 'app'"},
+			wantContext: "app:staff",
 		},
 		{name: "uid:gid stays a pure identity switch", user: "1000:1000", wantContext: "1000:1000"},
 		{name: "uid with group stays a pure identity switch", user: "1000:staff", wantContext: "1000:staff"},
@@ -183,12 +215,12 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 		{name: "option-looking operand stays off the probe", user: "--help", wantContext: "--help"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			f := startFakeStepEnvd(t, test.existing, test.failCmd, test.breakProbe)
+			f := startFakeStepEnvd(t, test.existing, test.failCmd, test.breakProbe, test.idMissExit)
 			p := &buildPipeline{
 				ctx:  context.Background(),
 				spec: &configsock.BuildSpec{Timeouts: configsock.BuildTimeouts{StepSec: 5}},
 			}
-			c := &stepCtx{env: map[string]string{}}
+			c := &stepCtx{env: poison}
 			err := p.applyStep(nil, &envdExec{uds: f.addr}, c, 0,
 				configsock.BuildStep{Type: "USER", Args: []string{test.user}})
 			if test.wantErr != "" {
@@ -204,6 +236,12 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 			for _, call := range f.recorded() {
 				if call.user != "root" {
 					t.Fatalf("USER step probe ran as %q, want root", call.user)
+				}
+				if strings.Contains(call.path, "/opt/shadow") {
+					t.Fatalf("USER step probe PATH %q inherited the image-supplied PATH", call.path)
+				}
+				if !strings.Contains(call.path, "/usr/sbin") {
+					t.Fatalf("USER step probe PATH %q lacks the trusted directories", call.path)
 				}
 				cmds = append(cmds, call.cmd)
 			}
