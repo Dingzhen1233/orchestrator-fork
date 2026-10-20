@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,13 @@ func (f *fakeStepEnvd) recorded() []fakeStepEnvdCall {
 	defer f.mu.Unlock()
 	return append([]fakeStepEnvdCall(nil), f.calls...)
 }
+
+var (
+	fakeIDProbe  = regexp.MustCompile(`^id -u -- '([^']+)'$`)
+	fakeUseradd  = regexp.MustCompile(`^useradd --create-home --shell /bin/bash -- '([^']+)'$`)
+	accountProbe = "id -u -- 'app'"
+	accountAdd   = "useradd --create-home --shell /bin/bash -- 'app'"
+)
 
 func startFakeStepEnvd(t *testing.T, existing []string, failCmd string) *fakeStepEnvd {
 	t.Helper()
@@ -79,17 +87,16 @@ func startFakeStepEnvd(t *testing.T, existing []string, failCmd string) *fakeSte
 		f.mu.Unlock()
 
 		exit := 0
-		switch {
-		case strings.HasPrefix(cmd, "id -u "):
-			if !f.existing[cmd[len("id -u "):]] {
+		if m := fakeIDProbe.FindStringSubmatch(cmd); m != nil {
+			if !f.existing[m[1]] {
 				exit = 1
 			}
-		case strings.HasPrefix(cmd, "useradd "):
+		} else if m := fakeUseradd.FindStringSubmatch(cmd); m != nil {
 			if failCmd != "" && strings.HasPrefix(cmd, failCmd) {
 				exit = 1
-			} else if fields := strings.Fields(cmd); len(fields) > 0 {
+			} else {
 				f.mu.Lock()
-				f.existing[fields[len(fields)-1]] = true
+				f.existing[m[1]] = true
 				f.mu.Unlock()
 			}
 		}
@@ -125,20 +132,39 @@ func TestUserStepResolvesAndCreatesAccount(t *testing.T) {
 	}{
 		{
 			name: "existing account is only probed", user: "app", existing: []string{"app"},
-			wantCalls: []string{"id -u app"}, wantContext: "app",
+			wantCalls: []string{accountProbe}, wantContext: "app",
 		},
 		{
 			name:      "missing account is created",
 			user:      "app",
-			wantCalls: []string{"id -u app", "useradd --create-home --shell /bin/bash app"}, wantContext: "app",
+			wantCalls: []string{accountProbe, accountAdd}, wantContext: "app",
 		},
 		{
 			name: "creation failure fails the step", user: "app", failCmd: "useradd",
 			wantErr:   "create missing user",
-			wantCalls: []string{"id -u app", "useradd --create-home --shell /bin/bash app"},
+			wantCalls: []string{accountProbe, accountAdd},
+		},
+		{
+			// user:group keeps the full identity in the context while the
+			// account part is what gets guaranteed in the sandbox.
+			name: "user group form probes the account part", user: "app:staff", existing: []string{"app"},
+			wantCalls: []string{accountProbe}, wantContext: "app:staff",
+		},
+		{
+			name:      "user group form creates the account part",
+			user:      "app:1000",
+			wantCalls: []string{accountProbe, accountAdd}, wantContext: "app:1000",
 		},
 		{name: "uid:gid stays a pure identity switch", user: "1000:1000", wantContext: "1000:1000"},
+		{name: "uid with group stays a pure identity switch", user: "1000:staff", wantContext: "1000:staff"},
 		{name: "bare uid stays a pure identity switch", user: "0", wantContext: "0"},
+		{
+			// Shell metacharacters and option-looking operands never reach
+			// a shell: non-portable names keep the pre-change switch-only
+			// behavior.
+			name: "shell metacharacters stay off the probe", user: "missing || true", wantContext: "missing || true",
+		},
+		{name: "option-looking operand stays off the probe", user: "--help", wantContext: "--help"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := startFakeStepEnvd(t, test.existing, test.failCmd)

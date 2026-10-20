@@ -433,7 +433,8 @@ run-builder 对每阶段调用
   不入镜像;**bash 因此是带 steps/startCmd 构建的镜像契约**,e2b 同款)。USER step
   若为账户名,先在构建沙箱内解析(root 跑 `id -u`),缺失则以
   `useradd --create-home --shell /bin/bash` 创建(密码锁定)——对齐 e2b set_user
-  的执行语义,保证固化的 config User 必有 passwd 记录背书;`uid[:gid]` 数字形式
+  的执行语义,保证固化的 config User 必有 passwd 记录背书;`user[:group]` 身份
+  只取冒号前的账户部分参与校验/创建,`uid[:gid]` 数字形式与非可移植名
   仍为纯身份切换。步完后宿主
   把累积上下文叠回 base config 写回 guest,`flatten-ctl mountpoint /.kuasar-build`
   (自绑挂载点)+ `export --skip-mounts --runtime-config … --tmpdir /.kuasar-build

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -482,44 +483,49 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, sess *envdExec, c *stepCtx, 
 }
 
 // ensureStepUser realizes the e2b set_user execution semantics inside the
-// build sandbox: an account name is resolved there and created (home + bash,
-// password locked) when missing, so a USER step cannot pin a config User
-// that no passwd entry backs and later RUN steps see the account they are
-// asked to run as. Numeric "uid[:gid]" arguments stay pure identity switches
-// — they are resolved at exec time by uid and cannot be expressed by
-// useradd. Root runs both probes; an existing account changes nothing.
+// build sandbox: the account a USER step names is resolved there and created
+// (home + bash, password locked) when missing, so a USER step cannot pin a
+// config User that no passwd entry backs and later RUN steps see the account
+// they are asked to run as. Only the account part of a "user[:group]"
+// identity participates — id and useradd take a login name, while the full
+// identity stays in the accumulated context and the final config. Numeric
+// uid references and names outside the portable account charset stay pure
+// identity switches (resolved at exec time, or rejected by RUN exactly as
+// before this path existed), so no build input is ever shell-interpreted
+// here. Root runs both probes; an existing account changes nothing.
 func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user string) error {
-	if user == "" || stepUserIsNumeric(user) {
+	account, ok := stepUserAccount(user)
+	if !ok {
 		return nil
 	}
 	stepBudget := time.Duration(p.spec.Timeouts.StepSec) * time.Second
-	if err := sess.run(p.ctx, "root", "/", c.env, "id -u "+user, stepBudget, true); err == nil {
+	if err := sess.run(p.ctx, "root", "/", c.env, "id -u -- '"+account+"'", stepBudget, true); err == nil {
 		return nil
 	}
-	p.progress("step %d: USER %s (missing, creating)", i, user)
+	p.progress("step %d: USER %s (missing, creating)", i, account)
 	if err := sess.run(p.ctx, "root", "/", c.env,
-		"useradd --create-home --shell /bin/bash "+user, stepBudget, false); err != nil {
-		return fmt.Errorf("step %d (USER %s): create missing user: %w", i, user, err)
+		"useradd --create-home --shell /bin/bash -- '"+account+"'", stepBudget, false); err != nil {
+		return fmt.Errorf("step %d (USER %s): create missing user: %w", i, account, err)
 	}
 	return nil
 }
 
-// stepUserIsNumeric reports whether a USER argument is a "uid[:gid]" form
-// (all of its colon-separated parts are digits), as opposed to an account
-// name.
-func stepUserIsNumeric(user string) bool {
-	for _, part := range strings.Split(user, ":") {
-		if part == "" {
-			return false
-		}
-		for _, r := range part {
-			if r < '0' || r > '9' {
-				return false
-			}
-		}
+// stepUserAccount extracts the login a USER step must guarantee from its
+// identity argument: the part before the first ":" of a "user[:group]"
+// form, when that part names an account — it must start with a letter or
+// underscore and use only the portable charset id/useradd accept, which
+// also rules out shell metacharacters and option-looking operands. ok=false
+// marks every identity that stays a pure switch: numeric uid references
+// ("uid[:gid]") and non-portable names.
+func stepUserAccount(user string) (string, bool) {
+	account, _, _ := strings.Cut(user, ":")
+	if account == "" || !stepAccountPattern.MatchString(account) {
+		return "", false
 	}
-	return true
+	return account, true
 }
+
+var stepAccountPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9._-]*$`)
 
 // applyCopy realizes a COPY/ADD step: fetch the context tar (presigned GET,
 // platform plumbing — host-side, no guest), then stream it through
